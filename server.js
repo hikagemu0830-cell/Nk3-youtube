@@ -1,11 +1,16 @@
 // server.js — Render等で動くNode.js版 中継(リバース)プロキシ
 // 要件: Node.js 20+ / package.json に "type": "module"
+// 任意(高速化): npm i undici  → 接続プール + HTTP/2 で上流取得が速くなる（無くても動く）
 //
 // 構成（通信を丸ごとProxy経由にする3層）
 //  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<scheme>/<host>/<path> 経由）
 //  2) ブラウザ側 : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie などをProxy化
 //  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
-// 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
+//
+// 入口(エントリ)URL ※相対パスを壊さないよう、最終的に /~p/... へ302します
+//  /~b/<base64url(URL)>     例) /~b/aHR0cHM6Ly9leGFtcGxlLmNvbS8
+//  /~u?url=<URL>            例) /~u?url=https://example.com/
+//  /~u?b=<base64url(URL)>
 //
 // 環境変数
 //  TARGET            中継の主対象（既定 https://www.youtube.com/）
@@ -14,21 +19,24 @@
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
 //  HEADER_TIMEOUT_MS 上流のヘッダ待ち上限（既定 25000）
 //  BODY_TIMEOUT_MS   HTML/CSS本文の受信上限（既定 60000）
+//  CACHE_MB          静的ファイルのメモリキャッシュ上限（既定 64）
 
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
+import zlib from "node:zlib";
 import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-// ★修正: ターゲットをYouTubeに変更
 const TARGET = process.env.TARGET || "https://www.youtube.com/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
 const HEADER_TIMEOUT = Number(process.env.HEADER_TIMEOUT_MS) || 25000;
 const BODY_TIMEOUT = Number(process.env.BODY_TIMEOUT_MS) || 60000;
+const CACHE_MAX = (Number(process.env.CACHE_MB) || 64) * 1024 * 1024;
+const CACHE_ITEM_MAX = 1.5 * 1024 * 1024;
 const MAX_REWRITE_BYTES = 20 * 1024 * 1024;
 const MAX_BODY_BYTES = 100 * 1024 * 1024;
 const DEFAULT_UA =
@@ -41,6 +49,29 @@ const isSiteHost = (h) => SITE_HOSTS.includes(String(h).toLowerCase());
 const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ───────────────────────── 高速化: undici があれば接続プール+HTTP/2 ─────────────────────────
+let dispatcher;
+try {
+  const { Agent } = await import("undici");
+  dispatcher = new Agent({
+    connections: 64,
+    keepAliveTimeout: 30000,
+    keepAliveMaxTimeout: 600000,
+    allowH2: true,
+    bodyTimeout: 0,
+  });
+} catch {}
+
+// ───────────────────────── YouTube: embed を nocookie に統一 ─────────────────────────
+const YT_HOSTS = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]);
+const NC_HOST = "www.youtube-nocookie.com";
+// HTML/インラインJS/JSON中の絶対URL（\/ エスケープ込み）を一括置換
+const YT_TEXT_RE = /((?:https?:)?(?:\\?\/){2})(?:www\.|m\.)?youtube\.com((?:\\?\/)embed(?:\\?\/))/g;
+function ytEmbedFix(u) {
+  if (YT_HOSTS.has(u.hostname) && u.pathname.startsWith("/embed/")) u.hostname = NC_HOST;
+  return u;
+}
 
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
 function ckey(h) {
@@ -94,7 +125,21 @@ function resolveUpstream(req, url, myOrigin) {
   return new URL(origin + url.pathname + url.search);
 }
 
-// ───────────────────────── SSRF対策 ─────────────────────────
+// base64url / 通常base64 どちらでも復号して URL にする
+function decodeEntry(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (/^https?:\/\//i.test(s)) return s;
+  try {
+    s = s.replace(/-/g, "+").replace(/_/g, "/").replace(/\s/g, "");
+    const out = Buffer.from(s, "base64").toString("utf8").trim();
+    if (/^https?:\/\//i.test(out)) return out;
+    if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(out)) return "https://" + out;
+  } catch {}
+  return null;
+}
+
+// ───────────────────────── SSRF対策（DNS結果は10分キャッシュ・同時問い合わせも共有） ─────────────────────────
 const dnsCache = new Map();
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -110,17 +155,17 @@ async function assertPublic(hostname) {
   if (isSiteHost(h)) return;
   if (!ALLOW_EXTERNAL) throw httpErr(403, "このサーバーはTARGET以外への中継を許可していません");
   if (/^(localhost|.*\.localhost|.*\.local|.*\.internal)$/.test(h)) throw httpErr(403, "blocked host");
-  const c = dnsCache.get(h);
-  if (c && c.exp > Date.now()) {
-    if (c.bad) throw httpErr(403, "blocked host");
-    return;
+  let c = dnsCache.get(h);
+  if (!c || c.exp < Date.now()) {
+    const p = net.isIP(h)
+      ? Promise.resolve(privateIp(h))
+      : dns.lookup(h, { all: true }).then((a) => a.some((x) => privateIp(x.address)));
+    c = { p, exp: Date.now() + 10 * 60 * 1000 };
+    if (dnsCache.size > 2000) dnsCache.clear();
+    dnsCache.set(h, c);
+    p.catch(() => dnsCache.delete(h));
   }
-  let bad;
-  if (net.isIP(h)) bad = privateIp(h);
-  else bad = (await dns.lookup(h, { all: true })).some((x) => privateIp(x.address));
-  if (dnsCache.size > 2000) dnsCache.clear();
-  dnsCache.set(h, { bad, exp: Date.now() + 60000 });
-  if (bad) throw httpErr(403, "blocked host");
+  if (await c.p) throw httpErr(403, "blocked host");
 }
 function httpErr(status, message) {
   const e = new Error(message);
@@ -131,15 +176,11 @@ function httpErr(status, message) {
 // ───────────────────────── HTML / CSS の書き換え ─────────────────────────
 const SKIP_RE = /^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|intent:|market:|ws:|wss:)/i;
 
-// ★修正: サーバー側のHTML書き換えで nocookie に置換
 function rewriteUrl(v, base, my) {
   const s = v.trim();
   if (!s || SKIP_RE.test(s) || s.startsWith(my + P)) return v;
   try {
-    const u = new URL(s, base);
-    if ((u.hostname === "www.youtube.com" || u.hostname === "youtube.com") && u.pathname.startsWith("/embed/")) {
-      u.hostname = "www.youtube-nocookie.com";
-    }
+    const u = ytEmbedFix(new URL(s, base)); // 先に絶対URL化してから nocookie 判定
     return toProxy(u.href, my).replace(/"/g, "%22").replace(/'/g, "%27");
   } catch {
     return v;
@@ -197,6 +238,9 @@ const TOKEN_RE =
 let SHIM_VER = "0";
 
 function rewriteHtml(html, upstream, my) {
+  // インラインJS/JSON内の youtube.com/embed/ を先に nocookie へ
+  if (html.includes("youtube.com")) html = html.replace(YT_TEXT_RE, "$1" + NC_HOST + "$2");
+
   let base = upstream.href;
   const bm = /<base\s[^>]*?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(html);
   if (bm) {
@@ -280,7 +324,6 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
   return h;
 }
 
-// ★修正: DROP_RES から "location" を削除（GitHub/Turbo対策）
 const DROP_RES = new Set(["content-security-policy", "content-security-policy-report-only", "x-frame-options", "strict-transport-security", "public-key-pins", "report-to", "nel", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy", "permissions-policy", "alt-svc", "link", "set-cookie", "content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "refresh", "content-location", "clear-site-data"]);
 
 function corsHeaders(req) {
@@ -296,12 +339,10 @@ function corsHeaders(req) {
   };
 }
 
-// ★修正: GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
-    
     if (k === "location" || k === "x-pjax-url" || k === "turbo-location") {
       try {
         h[k] = toProxy(new URL(v, upstream).href, myOrigin);
@@ -310,7 +351,6 @@ function responseHeaders(r, req, upstream, myOrigin) {
       }
       continue;
     }
-    
     h[k] = v;
   }
   Object.assign(h, corsHeaders(req));
@@ -318,6 +358,67 @@ function responseHeaders(r, req, upstream, myOrigin) {
   const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
   if (cookies.length) h["set-cookie"] = cookies;
   return h;
+}
+
+// ───────────────────────── 圧縮（HTML/CSS/JS/JSONをbr/gzipで返して転送を軽く） ─────────────────────────
+const COMPRESSIBLE = /^(text\/(?!event-stream)|application\/(javascript|x-javascript|json|manifest\+json|xml|xhtml\+xml|rss\+xml|atom\+xml)|image\/svg\+xml)/i;
+function pickEnc(req) {
+  const a = String(req.headers["accept-encoding"] || "");
+  if (/\bbr\b/.test(a)) return "br";
+  if (/\bgzip\b/.test(a)) return "gzip";
+  return null;
+}
+function compressBuf(buf, enc) {
+  return new Promise((ok, ng) => {
+    const cb = (e, r) => (e ? ng(e) : ok(r));
+    if (enc === "br")
+      zlib.brotliCompress(buf, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buf.length } }, cb);
+    else zlib.gzip(buf, { level: 5 }, cb);
+  });
+}
+async function sendBuf(req, res, status, hdrs, buf, type) {
+  hdrs["vary"] = "Origin, Accept-Encoding";
+  const enc = pickEnc(req);
+  if (enc && buf.length > 1024 && COMPRESSIBLE.test(type || "") && !hdrs["content-encoding"]) {
+    try {
+      buf = await compressBuf(buf, enc);
+      hdrs["content-encoding"] = enc;
+    } catch {}
+  }
+  hdrs["content-length"] = buf.length;
+  res.writeHead(status, hdrs);
+  res.end(buf);
+}
+
+// ───────────────────────── 静的ファイルのメモリキャッシュ ─────────────────────────
+const CACHE = new Map();
+let cacheBytes = 0;
+const STATIC_RE = /^(application\/(javascript|x-javascript|font|x-font)|text\/(javascript|css)|image\/|font\/|application\/vnd\.ms-fontobject)/i;
+function cacheTtl(cc) {
+  if (!cc || /no-store|no-cache|private/i.test(cc)) return 0;
+  const m = /(?:s-maxage|max-age)=(\d+)/i.exec(cc);
+  return m ? Math.min(Number(m[1]), 3600) * 1000 : 0;
+}
+function cachePut(k, v) {
+  if (CACHE.has(k)) {
+    cacheBytes -= CACHE.get(k).buf.length;
+    CACHE.delete(k);
+  }
+  CACHE.set(k, v);
+  cacheBytes += v.buf.length;
+  for (const [kk, vv] of CACHE) {
+    if (cacheBytes <= CACHE_MAX) break;
+    cacheBytes -= vv.buf.length;
+    CACHE.delete(kk);
+  }
+}
+function cacheStore(key, status, hdrs, buf, type, ttl) {
+  const h = {};
+  for (const [k, v] of Object.entries(hdrs)) {
+    if (k.startsWith("access-control-") || k === "vary" || k === "content-length" || k === "content-encoding" || k === "set-cookie") continue;
+    h[k] = v;
+  }
+  cachePut(key, { status, hdrs: h, buf, type, exp: Date.now() + ttl });
 }
 
 // ───────────────────────── 上流への取得（再試行・タイムアウト付き） ─────────────────────────
@@ -330,12 +431,12 @@ async function fetchUpstream(upstream, init, canRetry, res) {
     res.once("close", onClose);
     const timer = setTimeout(() => ac.abort(new Error("upstream timeout")), HEADER_TIMEOUT);
     try {
-      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual" });
+      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual", ...(dispatcher ? { dispatcher } : {}) });
       clearTimeout(timer);
       if (canRetry && [502, 503, 504].includes(r.status) && i < tries) {
         res.off("close", onClose);
         r.body?.cancel().catch(() => {});
-        await sleep(300 * (i + 1));
+        await sleep(150 * (i + 1));
         continue;
       }
       return { r, ac };
@@ -344,7 +445,7 @@ async function fetchUpstream(upstream, init, canRetry, res) {
       res.off("close", onClose);
       lastErr = e;
       if (res.destroyed) throw e;
-      await sleep(300 * (i + 1));
+      await sleep(150 * (i + 1));
     }
   }
   throw lastErr;
@@ -398,12 +499,24 @@ async function handle(req, res) {
     return res.end("ok");
   }
   if (url.pathname === "/~shim.js") {
-    res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=3600" });
-    return res.end(SHIM_JS);
+    return sendBuf(req, res, 200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=86400" }, Buffer.from(SHIM_JS), "application/javascript");
   }
   if (url.pathname === "/~sw.js") {
     res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-cache", "service-worker-allowed": "/" });
     return res.end(SW_JS);
+  }
+  // 入口: /~b/<base64url> , /~u?url=... , /~u?b=...
+  if (url.pathname.startsWith("/~b/") || url.pathname === "/~u") {
+    let target = null;
+    if (url.pathname === "/~u") target = decodeEntry(url.searchParams.get("url")) || decodeEntry(url.searchParams.get("b"));
+    else {
+      let seg = url.pathname.slice(4);
+      try { seg = decodeURIComponent(seg); } catch {}
+      target = decodeEntry(seg.split("/")[0]);
+    }
+    if (!target) throw httpErr(400, "invalid entry url");
+    res.writeHead(302, { location: toProxy(target, myOrigin), "cache-control": "no-store" });
+    return res.end();
   }
   if (req.method === "OPTIONS") {
     res.writeHead(204, corsHeaders(req));
@@ -411,13 +524,37 @@ async function handle(req, res) {
   }
 
   const upstream = resolveUpstream(req, url, myOrigin);
+  const isDocReq = /text\/html/i.test(req.headers.accept || "");
+
+  // YouTube の /embed/ に直接来たら nocookie へ回す（iframe遷移の取りこぼし対策）
+  if (req.method === "GET" && YT_HOSTS.has(upstream.hostname.toLowerCase()) && upstream.pathname.startsWith("/embed/") &&
+      (req.headers["sec-fetch-dest"] === "iframe" || isDocReq)) {
+    res.writeHead(302, { location: myOrigin + P + "https/" + NC_HOST + upstream.pathname + upstream.search, "cache-control": "no-store" });
+    return res.end();
+  }
+
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
     throw httpErr(508, "Loop detected");
+
+  // キャッシュヒット（静的ファイルのみ）
+  const cacheable = req.method === "GET" && !req.headers.range && !isDocReq;
+  const ckeyStr = myOrigin + "|" + upstream.href;
+  if (cacheable) {
+    const c = CACHE.get(ckeyStr);
+    if (c) {
+      if (c.exp > Date.now()) {
+        const h = { ...c.hdrs, ...corsHeaders(req) };
+        return sendBuf(req, res, c.status, h, c.buf, c.type);
+      }
+      cacheBytes -= c.buf.length;
+      CACHE.delete(ckeyStr);
+    }
+  }
+
   await assertPublic(upstream.hostname);
 
   const body = await readBody(req);
   const headers = buildUpstreamHeaders(req, upstream, myOrigin);
-  const isDocReq = /text\/html/i.test(req.headers.accept || "");
   if (isDocReq) {
     headers.delete("if-none-match");
     headers.delete("if-modified-since");
@@ -427,7 +564,6 @@ async function handle(req, res) {
   const status = r.status;
   const hdrs = responseHeaders(r, req, upstream, myOrigin);
 
-  // ★修正: リダイレクト処理をヘッダベースに変更（GitHub等対応）
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
     hdrs["cache-control"] = "no-store";
@@ -449,6 +585,9 @@ async function handle(req, res) {
     return res.end();
   }
 
+  const ttl = cacheable && status === 200 && !hdrs["set-cookie"] && STATIC_RE.test(type) ? cacheTtl(r.headers.get("cache-control")) : 0;
+
+  // HTML / CSS: 書き換え
   if ((isHtml || isCss) && !(Number(lenH) > MAX_REWRITE_BYTES)) {
     const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
     let buf;
@@ -459,17 +598,42 @@ async function handle(req, res) {
     }
     const text = decode(buf, charsetOf(type, buf));
     const out = Buffer.from(isHtml ? rewriteHtml(text, upstream, myOrigin) : rewriteCss(text, upstream.href, myOrigin), "utf8");
-    hdrs["content-type"] = (isHtml ? "text/html" : "text/css") + "; charset=utf-8";
-    hdrs["content-length"] = out.length;
+    const ct = (isHtml ? "text/html" : "text/css") + "; charset=utf-8";
+    hdrs["content-type"] = ct;
     if (isHtml) {
       hdrs["cache-control"] = "no-store";
       delete hdrs.etag;
       delete hdrs["last-modified"];
-    }
-    res.writeHead(status, hdrs);
-    return res.end(out);
+    } else if (ttl > 0) cacheStore(ckeyStr, status, hdrs, out, ct, ttl);
+    return sendBuf(req, res, status, hdrs, out, ct);
   }
 
+  // 小さい静的ファイル: 読み切ってキャッシュ
+  if (ttl > 0 && lenH && Number(lenH) <= CACHE_ITEM_MAX) {
+    const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
+    let buf;
+    try {
+      buf = Buffer.from(await r.arrayBuffer());
+    } finally {
+      clearTimeout(timer);
+    }
+    if (buf.length <= CACHE_ITEM_MAX * 4) cacheStore(ckeyStr, status, hdrs, buf, type, ttl);
+    return sendBuf(req, res, status, hdrs, buf, type);
+  }
+
+  // それ以外: ストリーム転送（テキスト系はその場で圧縮）
+  const encOut = status === 200 && !req.headers.range && COMPRESSIBLE.test(type) ? pickEnc(req) : null;
+  if (encOut) {
+    delete hdrs["content-length"];
+    hdrs["content-encoding"] = encOut;
+    hdrs["vary"] = "Origin, Accept-Encoding";
+    res.writeHead(status, hdrs);
+    const z = encOut === "br"
+      ? zlib.createBrotliCompress({ params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } })
+      : zlib.createGzip({ level: 5 });
+    pipeline(Readable.fromWeb(r.body), z, res, () => {});
+    return;
+  }
   if (lenH && !enc) hdrs["content-length"] = lenH;
   res.writeHead(status, hdrs);
   pipeline(Readable.fromWeb(r.body), res, () => {});
@@ -523,6 +687,7 @@ function makeShim() {
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
 var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+var NC=${JSON.stringify(NC_HOST)},YTH={"www.youtube.com":1,"youtube.com":1,"m.youtube.com":1};
 var ckey=${ckey.toString()};
 function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
 function parseP(pn){
@@ -535,7 +700,7 @@ function realBase(){
   catch(e){return new URL(T)}
 }
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
-// ★修正: JSで生成されるURLも nocookie に変換
+// 先に「本当のURL」へ解決してから youtube /embed/ を nocookie に置換する（相対 /embed/ID も対象）
 function prox(h){
   try{
     if(h==null)return h;
@@ -543,17 +708,18 @@ function prox(h){
     var t=String(h).trim();
     if(!t||SKIP.test(t))return h;
     var u=new URL(t,location.href);
-    
-    if ((u.hostname === "www.youtube.com" || u.hostname === "youtube.com") && u.pathname.indexOf("/embed/") === 0) {
-      u.hostname = "www.youtube-nocookie.com";
-    }
-
     if(u.protocol!=="http:"&&u.protocol!=="https:")return h;
     if(u.origin===O){
-      if(u.pathname.indexOf(P)===0||u.pathname.indexOf("/~")===0)return u.href;
+      if(u.pathname.indexOf(P)===0){
+        var pp=parseP(u.pathname);
+        if(pp&&YTH[new URL(pp.origin).hostname]&&pp.path.indexOf("/embed/")===0)return O+P+"https/"+NC+pp.path+u.search+u.hash;
+        return u.href;
+      }
+      if(u.pathname.indexOf("/~")===0)return u.href;
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
+    if(YTH[u.hostname]&&u.pathname.indexOf("/embed/")===0)u.hostname=NC;
     if(isSite(u.hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
@@ -646,6 +812,24 @@ try{
   }
 }catch(e){}
 
+// 動的に追加された iframe（YouTube IFrame API 等）の src も後から補正
+try{
+  new MutationObserver(function(ms){
+    for(var i=0;i<ms.length;i++){
+      var ns=ms[i].addedNodes;
+      for(var j=0;j<ns.length;j++){
+        var n=ns[j];
+        if(!n||n.nodeType!==1)continue;
+        var fr=n.tagName==="IFRAME"?[n]:(n.querySelectorAll?[].slice.call(n.querySelectorAll("iframe")):[]);
+        fr.forEach(function(f){
+          var raw=f.getAttribute("src");if(!raw)return;
+          var t=prox(raw);if(t!==raw)sa.call(f,"src",t);
+        });
+      }
+    }
+  }).observe(document,{childList:true,subtree:true});
+}catch(e){}
+
 try{
   if(navigator.serviceWorker){
     var reg0=navigator.serviceWorker.register.bind(navigator.serviceWorker);
@@ -733,4 +917,4 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10000).unref();
 });
-server.listen(PORT, () => console.log(`relay listening on ${PORT} -> ${TARGET}`));
+server.listen(PORT, () => console.log(`relay listening on ${PORT} -> ${TARGET} (undici: ${dispatcher ? "on" : "off"})`));
