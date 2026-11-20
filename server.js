@@ -5,18 +5,20 @@
 //  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<scheme>/<host>/<path> 経由）
 //  2) ブラウザ側 : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie などをProxy化
 //  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
-// 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
 //
-// 追加: ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
+// TARGET のサイトは「ルート直下」でそのまま中継される（TARGET と完全一致するホストのみ）
+// TARGET 以外のホスト（www違い・別ドメイン含む）は必ず /~p/<scheme>/<host>/... の明示形式
+//
+// ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
 //
 // ルート直下パスの扱い
-//  - 外部サイトのページ上で TARGET を指すURLは /~p/https/<TARGET host>/... と明示する
+//  - 外部サイトのページ上の TARGET 宛URLは /~p/ 形式で明示する
 //  - ルート直下パスは、Refererが「/~p/ 形式の外部ページ」ならそのサイトへ、それ以外は TARGET へ
 //  - /~p/ 経由のリクエストのリダイレクト(Location)は常に /~p/ 形式で返す（ループ防止）
 //  - 自分自身へのリダイレクトを検出したらエラーにして止める
 //
 // 環境変数
-//  TARGET            中継の主対象（既定 https://lovable.dev/）
+//  TARGET            中継の主対象（既定 https://www.youtube.com/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
@@ -30,7 +32,7 @@ import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-const TARGET = process.env.TARGET || "https://youtube.com/";
+const TARGET = process.env.TARGET || "https://www.youtube.com/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
@@ -42,9 +44,8 @@ const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 const BASE = new URL(TARGET);
-const BARE = BASE.hostname.replace(/^www\./i, "");
-const SITE_HOSTS = [BARE, "www." + BARE];
-const isSiteHost = (h) => SITE_HOSTS.includes(String(h).toLowerCase());
+const SITE_HOST = BASE.hostname.toLowerCase(); // TARGET と完全一致するホストだけを「ルート直下で扱うサイト」とする
+const isSiteHost = (h) => String(h).toLowerCase() === SITE_HOST;
 const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -63,7 +64,7 @@ function ckey(h) {
 const CK = (h) => "__px_" + ckey(h) + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
-// explicitSite=true: TARGET を指すとき、ルート直下ではなく /~p/ 形式で明示する
+// explicitSite=true: 外部サイトのページ上などで、TARGET宛も /~p/ 形式で明示する
 function toProxy(href, myOrigin, explicitSite) {
   let u;
   try { u = new URL(href); } catch { return href; }
@@ -102,12 +103,13 @@ function resolveUpstream(req, url, myOrigin) {
   //    Refererが「/~p/ 形式の外部ページ」のときだけ、そのサイトの相対パスとして扱う
   //    それ以外は TARGET
   let origin = BASE.origin;
-  if (req.headers.referer) {
+  const referer = req.headers.referer;
+  if (referer) {
     let refUrl = null;
-    try { refUrl = new URL(req.headers.referer); } catch {}
+    try { refUrl = new URL(referer); } catch {}
     if (refUrl && refUrl.origin === myOrigin && refUrl.pathname.startsWith(P)) {
-      const real = realFromProxyUrl(req.headers.referer, myOrigin);
-      if (real && !isSiteHost(real.hostname) && !isDirectHost(real.hostname)) origin = real.origin;
+      const real = realFromProxyUrl(referer, myOrigin);
+      if (real && !isDirectHost(real.hostname)) origin = real.origin;
     }
   }
   return new URL(origin + url.pathname + url.search);
@@ -154,7 +156,7 @@ function rewriteUrl(v, base, my) {
   const s = v.trim();
   if (!s || SKIP_RE.test(s) || s.startsWith(my + P)) return v;
   try {
-    // 今いるページが外部サイトなら、TARGET へのリンクは /~p/ 形式で明示する
+    // 今いるページが外部サイトなら、TARGET へのリンクも /~p/ 形式で明示する
     let ext = false;
     try { ext = !isSiteHost(new URL(base).hostname); } catch {}
     return toProxy(new URL(s, base).href, my, ext).replace(/"/g, "%22").replace(/'/g, "%27");
@@ -310,11 +312,10 @@ function corsHeaders(req) {
     "access-control-allow-headers": req.headers["access-control-request-headers"] || "*",
     "access-control-expose-headers": "*",
     "access-control-max-age": "86400",
-    vary: "Origin",
   };
 }
 
-// GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
+// Location / PJAX系ヘッダをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
   // 外部サイトのレスポンス、または /~p/ 明示形式で来たリクエストは、Locationも /~p/ 形式で返す
@@ -335,7 +336,11 @@ function responseHeaders(r, req, upstream, myOrigin) {
 
     h[k] = v;
   }
+  // CORSヘッダで上流の vary を消さないようにマージする
+  const upVary = h.vary;
   Object.assign(h, corsHeaders(req));
+  h.vary = upVary ? `${upVary}, Origin` : "Origin";
+
   const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
   const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
   if (cookies.length) h["set-cookie"] = cookies;
@@ -460,13 +465,13 @@ async function handle(req, res) {
   // リダイレクト処理（自分自身へのリダイレクトは止める）
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
+    let selfLoop = false;
     try {
       const self = new URL(req.url, myOrigin).href;
       const dest = new URL(hdrs["location"], myOrigin).href;
-      if (self === dest) throw httpErr(508, "Redirect loop detected");
-    } catch (e) {
-      if (e && e.status === 508) throw e;
-    }
+      selfLoop = self === dest;
+    } catch {}
+    if (selfLoop) throw httpErr(508, "Redirect loop detected");
     hdrs["cache-control"] = "no-store";
     res.writeHead(status, hdrs);
     return res.end();
@@ -561,10 +566,10 @@ function makeShim() {
   return String.raw`(function(){
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
-var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},SITE=${JSON.stringify(SITE_HOST)};
 var DIRECT=${DIRECT_RE.toString()};
 var ckey=${ckey.toString()};
-function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
+function isSite(h){return String(h).toLowerCase()===SITE}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
   var m=/^(https?)\/([^\/]+)(\/.*)?$/.exec(pn.slice(P.length));
@@ -710,10 +715,10 @@ try{
 // ───────────────────────── ServiceWorker（最終的に全通信を回収） ─────────────────────────
 function makeSw() {
   return String.raw`"use strict";
-const P=${JSON.stringify(P)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+const P=${JSON.stringify(P)},SITE=${JSON.stringify(SITE_HOST)};
 const DIRECT=${DIRECT_RE.toString()};
 const O=self.location.origin;
-const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
+const isSite=(h)=>String(h).toLowerCase()===SITE;
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
@@ -744,6 +749,7 @@ async function handle(e,req,u){
   try{
     let target=null;
     if(u.origin===O){
+      // 外部サイトのページ（/~p/形式）から出るルート直下リクエストは、そのサイト宛にする
       const c=await clientReal(e.clientId||e.resultingClientId);
       if(c&&!isSite(c.host.replace(/:\d+$/,""))&&!DIRECT.test(c.host))target=O+P+c.scheme+"/"+c.host+u.pathname+u.search;
     }else{
