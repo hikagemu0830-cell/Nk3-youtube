@@ -830,6 +830,44 @@ try{
   }).observe(document,{childList:true,subtree:true});
 }catch(e){}
 
+// YouTube視聴ページ(/watch?v=ID): botチェックで止まる本体プレイヤーを nocookie の埋め込みに差し替える
+// （SPA遷移でも動くよう、URL変化を監視して付け替える）
+(function(){
+  if(window!==window.top)return;
+  var cur="";
+  function vid(){
+    try{var rb=realBase();if(!YTH[rb.hostname]||rb.pathname!=="/watch")return "";return rb.searchParams.get("v")||""}catch(e){return ""}
+  }
+  function box(){
+    return document.querySelector("#player-container-outer")||document.querySelector("#player.ytd-watch-flexy")||document.querySelector("ytd-player");
+  }
+  function tick(){
+    try{
+      var id=vid(),old=document.getElementById("__pxEmb");
+      if(!id){if(old)old.remove();cur="";return}
+      var b=box();if(!b)return;
+      if(old&&cur===id&&b.contains(old))return;
+      if(old)old.remove();
+      var f=document.createElement("iframe");
+      f.id="__pxEmb";
+      f.setAttribute("allow","autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write");
+      f.setAttribute("allowfullscreen","");
+      f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;z-index:2200;background:#000";
+      if(getComputedStyle(b).position==="static")b.style.position="relative";
+      f.src="https://www.youtube-nocookie.com/embed/"+encodeURIComponent(id)+"?autoplay=1&rel=0";
+      b.appendChild(f);cur=id;
+    }catch(e){}
+  }
+  // 差し替え中は本体側の動画が鳴らないよう止める
+  document.addEventListener("play",function(e){
+    var t=e.target;
+    if(t&&t.tagName==="VIDEO"&&document.getElementById("__pxEmb")){try{t.pause()}catch(x){}}
+  },true);
+  window.addEventListener("yt-navigate-finish",tick);
+  window.addEventListener("popstate",tick);
+  setInterval(tick,600);
+})();
+
 try{
   if(navigator.serviceWorker){
     var reg0=navigator.serviceWorker.register.bind(navigator.serviceWorker);
