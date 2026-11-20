@@ -9,11 +9,11 @@
 //
 // 追加: ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
 //
-// ルート直下パスの扱い（今回の修正）
+// ルート直下パスの扱い
 //  - 外部サイトのページ上で TARGET を指すURLは /~p/https/<TARGET host>/... と明示する
-//    → ルート直下パス = 「今いるサイト内の相対パス」と常に解釈できる
-//  - ルート直下パスは、Refererが「自分のProxyページ」ならそのページのサイトへ（遷移でも）
-//    Refererが無い/他サイトなら TARGET へ
+//  - ルート直下パスは、Refererが「/~p/ 形式の外部ページ」ならそのサイトへ、それ以外は TARGET へ
+//  - /~p/ 経由のリクエストのリダイレクト(Location)は常に /~p/ 形式で返す（ループ防止）
+//  - 自分自身へのリダイレクトを検出したらエラーにして止める
 //
 // 環境変数
 //  TARGET            中継の主対象（既定 https://lovable.dev/）
@@ -54,7 +54,6 @@ const DIRECT_RE = /nocookie/i;
 const isDirectHost = (h) => DIRECT_RE.test(String(h));
 
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
-// 1つのProxyドメインに複数サイトのcookieが混ざらないよう、サイトごとに接頭辞を付ける
 function ckey(h) {
   var p = String(h).toLowerCase().split(".");
   var n = 2;
@@ -64,7 +63,7 @@ function ckey(h) {
 const CK = (h) => "__px_" + ckey(h) + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
-// explicitSite=true: 外部サイトのページ上で TARGET を指すとき、ルート直下ではなく /~p/ 形式で明示する
+// explicitSite=true: TARGET を指すとき、ルート直下ではなく /~p/ 形式で明示する
 function toProxy(href, myOrigin, explicitSite) {
   let u;
   try { u = new URL(href); } catch { return href; }
@@ -99,15 +98,14 @@ function resolveUpstream(req, url, myOrigin) {
   const p = parseProxyPath(url.pathname);
   if (p) return new URL(p.origin + p.path + url.search);
 
-  // 2) ルート直下のパス（/watch 等）
-  //    Refererが「自分のProxyページ」ならそのページのサイトの相対パスとして扱う（遷移も含む）
-  //    それ以外（Refererなし / 他サイトからの訪問）は TARGET
-  //    ※外部ページ上の TARGET へのリンクは /~p/ 形式で明示されるので、ここには来ない
+  // 2) ルート直下のパス
+  //    Refererが「/~p/ 形式の外部ページ」のときだけ、そのサイトの相対パスとして扱う
+  //    それ以外は TARGET
   let origin = BASE.origin;
   if (req.headers.referer) {
-    let refOrigin = "";
-    try { refOrigin = new URL(req.headers.referer).origin; } catch {}
-    if (refOrigin === myOrigin) {
+    let refUrl = null;
+    try { refUrl = new URL(req.headers.referer); } catch {}
+    if (refUrl && refUrl.origin === myOrigin && refUrl.pathname.startsWith(P)) {
       const real = realFromProxyUrl(req.headers.referer, myOrigin);
       if (real && !isSiteHost(real.hostname) && !isDirectHost(real.hostname)) origin = real.origin;
     }
@@ -319,7 +317,10 @@ function corsHeaders(req) {
 // GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
-  const ext = !isSiteHost(upstream.hostname); // 外部サイトからのレスポンスか
+  // 外部サイトのレスポンス、または /~p/ 明示形式で来たリクエストは、Locationも /~p/ 形式で返す
+  let viaExplicit = false;
+  try { viaExplicit = !!parseProxyPath(new URL("http://local" + req.url).pathname); } catch {}
+  const ext = !isSiteHost(upstream.hostname) || viaExplicit;
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
 
@@ -456,9 +457,16 @@ async function handle(req, res) {
   const status = r.status;
   const hdrs = responseHeaders(r, req, upstream, myOrigin);
 
-  // リダイレクト処理
+  // リダイレクト処理（自分自身へのリダイレクトは止める）
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
+    try {
+      const self = new URL(req.url, myOrigin).href;
+      const dest = new URL(hdrs["location"], myOrigin).href;
+      if (self === dest) throw httpErr(508, "Redirect loop detected");
+    } catch (e) {
+      if (e && e.status === 508) throw e;
+    }
     hdrs["cache-control"] = "no-store";
     res.writeHead(status, hdrs);
     return res.end();
@@ -587,7 +595,7 @@ function prox(h){
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
     if(DIRECT.test(u.hostname))return u.href;
-    // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示（ルート直下だと今のサイトの相対パスと区別できない）
+    // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示
     if(isSite(u.hostname)&&isSite(realBase().hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
@@ -709,7 +717,7 @@ const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
-// 別オリジン宛はすべて /~p/ 形式で明示（TARGET宛もルート直下にしない: 外部ページ上のRefererで誤って解釈されるのを防ぐ）
+// 別オリジン宛はすべて /~p/ 形式で明示
 function toProxy(u){
   if(u.protocol!=="http:"&&u.protocol!=="https:")return null;
   if(DIRECT.test(u.hostname))return null;
