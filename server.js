@@ -10,6 +10,13 @@
 // TARGET 以外のホスト（www違い・別ドメイン含む）は必ず /~p/<scheme>/<host>/... の明示形式
 //
 // ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
+// youtube.com の /embed/ID は youtube-nocookie.com へ直接つなぐ（中継しない）
+//
+// 再生（nocookie オーバーレイ）
+//  - /watch?v=ID /live/ID /shorts/ID を開いたとき、ブラウザ側(shim)が
+//    プレイヤーの位置に youtube-nocookie.com の iframe を上から重ねて再生する
+//  - 重ねている間は元のネイティブ動画を一時停止する
+//  - 閉じるボタンで消せる（別の動画に移動すると再び重ねる）
 //
 // ルート直下パスの扱い
 //  - 外部サイトのページ上の TARGET 宛URLは /~p/ 形式で明示する
@@ -54,6 +61,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const DIRECT_RE = /nocookie/i;
 const isDirectHost = (h) => DIRECT_RE.test(String(h));
 
+// youtube.com の埋め込み(/embed/)は youtube-nocookie.com へ差し替える
+const YT_HOST_RE = /^(www\.|m\.)?youtube\.com$/i;
+function toNocookie(u) {
+  if (YT_HOST_RE.test(u.hostname) && u.pathname.startsWith("/embed/")) {
+    const n = new URL(u.href);
+    n.hostname = "www.youtube-nocookie.com";
+    return n;
+  }
+  return u; // 変更なしなら同じオブジェクトを返す
+}
+
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
 function ckey(h) {
   var p = String(h).toLowerCase().split(".");
@@ -67,7 +85,7 @@ const CK = (h) => "__px_" + ckey(h) + "__";
 // explicitSite=true: 外部サイトのページ上などで、TARGET宛も /~p/ 形式で明示する
 function toProxy(href, myOrigin, explicitSite) {
   let u;
-  try { u = new URL(href); } catch { return href; }
+  try { u = toNocookie(new URL(href)); } catch { return href; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return href;
   if (isDirectHost(u.hostname)) return u.href; // 直接表示
   if (isSiteHost(u.hostname) && !explicitSite) return myOrigin + u.pathname + u.search + u.hash;
@@ -440,10 +458,13 @@ async function handle(req, res) {
 
   const upstream = resolveUpstream(req, url, myOrigin);
 
-  // /~p/ 経由で nocookie に来てしまった場合は直接URLへリダイレクト
-  if (isDirectHost(upstream.hostname) && req.method === "GET" && parseProxyPath(url.pathname)) {
-    res.writeHead(302, { location: upstream.href, "cache-control": "no-store" });
-    return res.end();
+  // youtube の埋め込み(/embed/)と、/~p/ 経由で nocookie に来たものは、中継せず直接URLへ302
+  if (req.method === "GET") {
+    const nc = toNocookie(upstream);
+    if (nc !== upstream || (isDirectHost(upstream.hostname) && parseProxyPath(url.pathname))) {
+      res.writeHead(302, { location: nc.href, "cache-control": "no-store" });
+      return res.end();
+    }
   }
 
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
@@ -579,6 +600,12 @@ function realBase(){
   try{var p=parseP(location.pathname);return p?new URL(p.origin+p.path+location.search):new URL(T+location.pathname+location.search)}
   catch(e){return new URL(T)}
 }
+// youtube.com の /embed/ は youtube-nocookie.com へ差し替える（中継しない）
+var YTH=/^(www\.|m\.)?youtube\.com$/i;
+function ytn(u){
+  if(YTH.test(u.hostname)&&u.pathname.indexOf("/embed/")===0){var n=new URL(u.href);n.hostname="www.youtube-nocookie.com";return n}
+  return u;
+}
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
 // どんなURLでもProxy経由のURLへ（何度通しても結果は同じ）
 function prox(h){
@@ -592,13 +619,14 @@ function prox(h){
     if(u.origin===O){
       if(u.pathname.indexOf(P)===0){
         var pp=parseP(u.pathname);
-        if(pp){var ro=new URL(pp.origin+pp.path+u.search+u.hash);if(DIRECT.test(ro.hostname))return ro.href}
+        if(pp){var ro=ytn(new URL(pp.origin+pp.path+u.search+u.hash));if(DIRECT.test(ro.hostname))return ro.href}
         return u.href;
       }
       if(u.pathname.indexOf("/~")===0)return u.href;
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
+    u=ytn(u);
     if(DIRECT.test(u.hostname))return u.href;
     // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示
     if(isSite(u.hostname)&&isSite(realBase().hostname))return O+u.pathname+u.search+u.hash;
@@ -684,7 +712,7 @@ function fixForm(f){
 document.addEventListener("submit",function(e){if(e.target)fixForm(e.target)},true);
 try{var fs=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){fixForm(this);return fs.call(this)}}catch(e){}
 ["pushState","replaceState"].forEach(function(m){
-  var o=history[m];history[m]=function(s,t,u){try{if(u!=null)u=prox(u)}catch(e){}return o.call(this,s,t,u)};
+  var o=history[m];history[m]=function(s,t,u){try{if(u!=null)u=prox(u)}catch(e){}var r=o.call(this,s,t,u);try{setTimeout(ytSync,0)}catch(e){}return r};
 });
 try{var wo=window.open;window.open=function(u){var a=[].slice.call(arguments);if(u!=null&&u!=="")a[0]=prox(u);return wo.apply(this,a)}}catch(e){}
 try{
@@ -699,6 +727,79 @@ try{
     });
   }
 }catch(e){}
+
+// ── nocookie 再生オーバーレイ（watch / live / shorts）
+// 再生ページを開くと、プレイヤーの位置に youtube-nocookie.com の iframe を上から重ねる
+var ytOv=null,ytTimer=0,ytDismissed="";
+function ytId(ru){
+  try{
+    var h=ru.hostname.toLowerCase(),m;
+    if(h==="youtu.be"){m=/^\/([\w-]{6,})/.exec(ru.pathname);return m?{id:m[1],short:false}:null}
+    if(!/(^|\.)youtube\.com$/.test(h))return null;
+    var v=ru.searchParams.get("v");
+    if(ru.pathname==="/watch"&&v&&/^[\w-]{6,}$/.test(v))return {id:v,short:false};
+    m=/^\/(shorts|live)\/([\w-]{6,})/.exec(ru.pathname);
+    if(m)return {id:m[2],short:m[1]==="shorts"};
+    return null;
+  }catch(e){return null}
+}
+function ytPauseNative(){
+  try{var vs=document.querySelectorAll("video");for(var i=0;i<vs.length;i++){if(!vs[i].paused)vs[i].pause()}}catch(e){}
+}
+function ytPos(shortMode){
+  if(!ytOv)return;
+  var el=document.querySelector(shortMode
+    ?"ytd-reel-video-renderer[is-active] video, ytd-reel-video-renderer[is-active] .video-container"
+    :"#movie_player, #player-container-inner, ytd-player");
+  var r=null;
+  if(el){var b=el.getBoundingClientRect();if(b.width>0&&b.height>0)r=b}
+  var s=ytOv.style,W=window.innerWidth,H=window.innerHeight;
+  if(r){s.left=r.left+"px";s.top=r.top+"px";s.width=r.width+"px";s.height=r.height+"px"}
+  else if(shortMode){var w=Math.min(W,H*9/16);s.left=((W-w)/2)+"px";s.top="0px";s.width=w+"px";s.height=H+"px"}
+  else{s.left="0px";s.top="0px";s.width=W+"px";s.height=H+"px"}
+}
+function ytUnmount(){
+  if(ytTimer){clearInterval(ytTimer);ytTimer=0}
+  if(ytOv){try{ytOv.parentNode&&ytOv.parentNode.removeChild(ytOv)}catch(e){}ytOv=null}
+}
+function ytMount(info){
+  var shortMode=info.short;
+  var box=document.createElement("div");
+  box.setAttribute("data-id",info.id);
+  box.style.cssText="position:fixed;z-index:2147483600;background:#000;overflow:hidden;margin:0;padding:0";
+  var f=document.createElement("iframe");
+  f.src="https://www.youtube-nocookie.com/embed/"+encodeURIComponent(info.id)+"?autoplay=1&rel=0&playsinline=1";
+  f.setAttribute("allow","accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
+  f.setAttribute("allowfullscreen","");
+  f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;margin:0";
+  box.appendChild(f);
+  var x=document.createElement("button");
+  x.type="button";
+  x.textContent="×";
+  x.setAttribute("aria-label","閉じる");
+  x.style.cssText="position:absolute;top:6px;right:6px;z-index:2;width:32px;height:32px;border:0;border-radius:16px;background:rgba(0,0,0,.6);color:#fff;font-size:20px;line-height:32px;padding:0;cursor:pointer";
+  x.onclick=function(e){e.preventDefault();e.stopPropagation();ytDismissed=info.id;ytUnmount()};
+  box.appendChild(x);
+  document.documentElement.appendChild(box);
+  ytOv=box;
+  ytPos(shortMode);
+  ytPauseNative();
+  ytTimer=setInterval(function(){ytPos(shortMode);ytPauseNative()},500);
+}
+function ytSync(){
+  try{
+    var info=ytId(realBase());
+    if(!info){ytDismissed="";ytUnmount();return}
+    if(info.id===ytDismissed){ytUnmount();return}
+    if(ytOv&&ytOv.getAttribute("data-id")===info.id){ytPos(info.short);return}
+    ytUnmount();
+    ytMount(info);
+  }catch(e){}
+}
+window.addEventListener("popstate",function(){setTimeout(ytSync,0)});
+document.addEventListener("yt-navigate-finish",function(){ytSync()});
+setInterval(ytSync,800);
+ytSync();
 
 // ── ServiceWorker: 自分のSWを登録し、サイト側のSW登録は無効化
 try{
