@@ -9,10 +9,11 @@
 //
 // 追加: ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
 //
-// 修正点（ルート直下パスの誤転送）
-//  - ページ遷移(navigation/iframe)は Referer を一切見ず、必ず TARGET へ転送する
-//  - Referer を見るのは「サブリソース（画像・JS等）」かつ「Refererが外部サイトのProxyページ」の場合だけ
-//    → 別サイト(GitHub等)のページからTARGETのリンクを踏んでも、GitHubへ飛ばなくなる
+// ルート直下パスの扱い（今回の修正）
+//  - 外部サイトのページ上で TARGET を指すURLは /~p/https/<TARGET host>/... と明示する
+//    → ルート直下パス = 「今いるサイト内の相対パス」と常に解釈できる
+//  - ルート直下パスは、Refererが「自分のProxyページ」ならそのページのサイトへ（遷移でも）
+//    Refererが無い/他サイトなら TARGET へ
 //
 // 環境変数
 //  TARGET            中継の主対象（既定 https://lovable.dev/）
@@ -48,7 +49,7 @@ const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ★追加: Proxyを通さず直接表示するホスト（nocookie を含むもの）
+// Proxyを通さず直接表示するホスト（nocookie を含むもの）
 const DIRECT_RE = /nocookie/i;
 const isDirectHost = (h) => DIRECT_RE.test(String(h));
 
@@ -63,12 +64,13 @@ function ckey(h) {
 const CK = (h) => "__px_" + ckey(h) + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
-function toProxy(href, myOrigin) {
+// explicitSite=true: 外部サイトのページ上で TARGET を指すとき、ルート直下ではなく /~p/ 形式で明示する
+function toProxy(href, myOrigin, explicitSite) {
   let u;
   try { u = new URL(href); } catch { return href; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return href;
-  if (isDirectHost(u.hostname)) return u.href; // ★直接表示
-  if (isSiteHost(u.hostname)) return myOrigin + u.pathname + u.search + u.hash;
+  if (isDirectHost(u.hostname)) return u.href; // 直接表示
+  if (isSiteHost(u.hostname) && !explicitSite) return myOrigin + u.pathname + u.search + u.hash;
   return myOrigin + P + u.protocol.slice(0, -1) + "/" + u.host + u.pathname + u.search + u.hash;
 }
 
@@ -91,31 +93,24 @@ function realFromProxyUrl(str, myOrigin) {
   }
 }
 
-// ページ遷移（ナビゲーション / iframe）かどうか
-function isNavigation(req) {
-  const dest = req.headers["sec-fetch-dest"];
-  const mode = req.headers["sec-fetch-mode"];
-  if (dest || mode) {
-    return mode === "navigate" || dest === "document" || dest === "iframe" || dest === "frame";
-  }
-  // Sec-Fetch-* が無い古いブラウザ向けの保険
-  return /text\/html/i.test(req.headers.accept || "");
-}
-
 // このリクエストが最終的に取りに行く上流URLを決める
 function resolveUpstream(req, url, myOrigin) {
   // 1) /~p/https/host/path は明示的な外部サイト指定 → そのまま
   const p = parseProxyPath(url.pathname);
   if (p) return new URL(p.origin + p.path + url.search);
 
-  // 2) ルート直下のパス（/projects/ 等）
-  //    ページ遷移は Referer を見ない → 必ず TARGET へ
-  //    （別サイトのページ上のリンクは、ここで TARGET に戻る）
+  // 2) ルート直下のパス（/watch 等）
+  //    Refererが「自分のProxyページ」ならそのページのサイトの相対パスとして扱う（遷移も含む）
+  //    それ以外（Refererなし / 他サイトからの訪問）は TARGET
+  //    ※外部ページ上の TARGET へのリンクは /~p/ 形式で明示されるので、ここには来ない
   let origin = BASE.origin;
-  if (!isNavigation(req) && req.headers.referer) {
-    // サブリソースのみ: Refererが「外部サイトのProxyページ」ならそのサイトへ
-    const real = realFromProxyUrl(req.headers.referer, myOrigin);
-    if (real && !isSiteHost(real.hostname)) origin = real.origin;
+  if (req.headers.referer) {
+    let refOrigin = "";
+    try { refOrigin = new URL(req.headers.referer).origin; } catch {}
+    if (refOrigin === myOrigin) {
+      const real = realFromProxyUrl(req.headers.referer, myOrigin);
+      if (real && !isSiteHost(real.hostname) && !isDirectHost(real.hostname)) origin = real.origin;
+    }
   }
   return new URL(origin + url.pathname + url.search);
 }
@@ -161,7 +156,10 @@ function rewriteUrl(v, base, my) {
   const s = v.trim();
   if (!s || SKIP_RE.test(s) || s.startsWith(my + P)) return v;
   try {
-    return toProxy(new URL(s, base).href, my).replace(/"/g, "%22").replace(/'/g, "%27");
+    // 今いるページが外部サイトなら、TARGET へのリンクは /~p/ 形式で明示する
+    let ext = false;
+    try { ext = !isSiteHost(new URL(base).hostname); } catch {}
+    return toProxy(new URL(s, base).href, my, ext).replace(/"/g, "%22").replace(/'/g, "%27");
   } catch {
     return v;
   }
@@ -303,7 +301,6 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
   return h;
 }
 
-// ★修正1: DROP_RES から "location" を削除
 const DROP_RES = new Set(["content-security-policy", "content-security-policy-report-only", "x-frame-options", "strict-transport-security", "public-key-pins", "report-to", "nel", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy", "permissions-policy", "alt-svc", "link", "set-cookie", "content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "refresh", "content-location", "clear-site-data"]);
 
 function corsHeaders(req) {
@@ -319,15 +316,16 @@ function corsHeaders(req) {
   };
 }
 
-// ★修正2: GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
+// GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
+  const ext = !isSiteHost(upstream.hostname); // 外部サイトからのレスポンスか
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
 
     if (k === "location" || k === "x-pjax-url" || k === "turbo-location") {
       try {
-        h[k] = toProxy(new URL(v, upstream).href, myOrigin);
+        h[k] = toProxy(new URL(v, upstream).href, myOrigin, ext);
       } catch {
         h[k] = v;
       }
@@ -436,7 +434,7 @@ async function handle(req, res) {
 
   const upstream = resolveUpstream(req, url, myOrigin);
 
-  // ★追加: /~p/ 経由で nocookie に来てしまった場合は直接URLへリダイレクト
+  // /~p/ 経由で nocookie に来てしまった場合は直接URLへリダイレクト
   if (isDirectHost(upstream.hostname) && req.method === "GET" && parseProxyPath(url.pathname)) {
     res.writeHead(302, { location: upstream.href, "cache-control": "no-store" });
     return res.end();
@@ -458,7 +456,7 @@ async function handle(req, res) {
   const status = r.status;
   const hdrs = responseHeaders(r, req, upstream, myOrigin);
 
-  // ★修正3: リダイレクト処理の簡略化
+  // リダイレクト処理
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
     hdrs["cache-control"] = "no-store";
@@ -589,7 +587,8 @@ function prox(h){
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
     if(DIRECT.test(u.hostname))return u.href;
-    if(isSite(u.hostname))return O+u.pathname+u.search+u.hash;
+    // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示（ルート直下だと今のサイトの相対パスと区別できない）
+    if(isSite(u.hostname)&&isSite(realBase().hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
 }
@@ -710,10 +709,10 @@ const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
+// 別オリジン宛はすべて /~p/ 形式で明示（TARGET宛もルート直下にしない: 外部ページ上のRefererで誤って解釈されるのを防ぐ）
 function toProxy(u){
   if(u.protocol!=="http:"&&u.protocol!=="https:")return null;
   if(DIRECT.test(u.hostname))return null;
-  if(isSite(u.hostname))return O+u.pathname+u.search;
   return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search;
 }
 async function clientReal(id){
